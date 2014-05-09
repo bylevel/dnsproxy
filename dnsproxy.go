@@ -20,14 +20,17 @@ import (
 )
 
 var (
-	dnss    = flag.String("dns", "192.168.2.1:53:udp,8.8.8.8:53:udp,8.8.4.4:53:udp,8.8.8.8:53:tcp,8.8.4.4:53:tcp", "dns address, use `,` as sep")
+	dnss    = flag.String("dns", "61.153.177.200:53:udp,61.153.177.202:53:udp,202.181.224.2:53:udp,8.8.8.8:53:udp,8.8.4.4:53:udp", "dns address, use `,` as sep")
 	local   = flag.String("local", ":53", "local listen address")
-	debug   = flag.Int("debug", 0, "debug level 0 1 2")
+	debug   = flag.Int("debug", 1, "debug level 0 1 2")
 	encache = flag.Bool("cache", true, "enable go-cache")
 	expire  = flag.Int64("expire", 3600, "default cache expire seconds, -1 means use doamin ttl time")
 	file    = flag.String("file", filepath.Join(path.Dir(os.Args[0]), "cache.dat"), "cached file")
 	ipv6    = flag.Bool("6", false, "skip ipv6 record query AAAA")
 	timeout = flag.Int("timeout", 200, "read/write timeout")
+
+	// 域名优先使用的dns服务器
+	priorDomainDns map[string]string
 
 	clientTCP *dns.Client
 	clientUDP *dns.Client
@@ -83,7 +86,7 @@ func init() {
 	DEBUG = *debug
 
 	runtime.GOMAXPROCS(runtime.NumCPU()*2 - 1)
-
+	// 设置两个dns client
 	clientTCP = new(dns.Client)
 	clientTCP.Net = "tcp"
 	clientTCP.ReadTimeout = time.Duration(*timeout) * time.Millisecond
@@ -114,6 +117,7 @@ func init() {
 				proto = "tcp"
 			}
 		}
+		// 验证协议格式的
 		_, err := net.ResolveTCPAddr("tcp", dns)
 		if err != nil {
 			log.Fatalf("wrong dns address %s\n", dns)
@@ -124,6 +128,10 @@ func init() {
 	if len(DNS) == 0 {
 		log.Fatalln("dns address must be not empty")
 	}
+
+	// 设置域名优先解析的DNS列表
+	priorDomainDns = make(map[string]string)
+	priorDomainDns["itunes.apple.com."] = "202.181.224.2:53:udp"
 
 	signal.Notify(saveSig, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
 }
@@ -181,7 +189,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 	if len(questions) == 0 {
 		return
 	}
-
+	// 替换掉question
 	req.Question = questions
 
 	id = req.Id
@@ -189,7 +197,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 	req.Id = 0
 	key = toMd5(req.String())
 	req.Id = id
-
+	// 查询缓存
 	if ENCACHE {
 		if reply, ok := conn.Get(key); ok {
 			data, _ = reply.([]byte)
@@ -211,26 +219,47 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			}
 		}
 	}
-
-	for i, parts := range DNS {
-		dns := parts[0]
-		proto := parts[1]
-		tried = i > 0
-		if DEBUG > 0 {
-			if tried {
-				log.Printf("id: %5d try: %v %s %s\n", id, query, dns, proto)
+	// todo 这里插入优先代码
+	for _, q := range req.Question {
+		// 判断是否有优先级的服务器设置
+		if _, ok := priorDomainDns[q.Name]; ok {
+			// 分割出dns跟proto
+			parts := strings.Split(priorDomainDns[q.Name], ":")
+			proto := parts[2]
+			dns := strings.Join(parts[:2], ":")
+			m, _, err = clientTCP.Exchange(req, dns)
+			if err == nil && len(m.Answer) > 0 {
+				used = dns
+				tried = true
+				log.Printf("优先命中 id: %5d resolve: %v %s %s\n", id, query, dns, proto)
+				break
 			} else {
-				log.Printf("id: %5d resolve: %v %s %s\n", id, query, dns, proto)
+				log.Println("优先出错：", err)
 			}
 		}
-		client := clientUDP
-		if proto == "tcp" {
-			client = clientTCP
-		}
-		m, _, err = client.Exchange(req, dns)
-		if err == nil && len(m.Answer) > 0 {
-			used = dns
-			break
+	}
+	if used == "" {
+		for i, parts := range DNS {
+			dns := parts[0]
+			proto := parts[1]
+			tried = i > 0
+			if DEBUG > 0 {
+				if tried {
+					log.Printf("id: %5d try: %v %s %s\n", id, query, dns, proto)
+				} else {
+					log.Printf("id: %5d resolve: %v %s %s\n", id, query, dns, proto)
+				}
+			}
+			client := clientUDP
+			if proto == "tcp" {
+				client = clientTCP
+			}
+			// 请求外部的dns服务器
+			m, _, err = client.Exchange(req, dns)
+			if err == nil && len(m.Answer) > 0 {
+				used = dns
+				break
+			}
 		}
 	}
 
