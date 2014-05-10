@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"syscall"
@@ -27,7 +28,7 @@ var (
 	expire  = flag.Int64("expire", 3600, "default cache expire seconds, -1 means use doamin ttl time")
 	file    = flag.String("file", filepath.Join(path.Dir(os.Args[0]), "cache.dat"), "cached file")
 	ipv6    = flag.Bool("6", false, "skip ipv6 record query AAAA")
-	timeout = flag.Int("timeout", 200, "read/write timeout")
+	timeout = flag.Int("timeout", 1000, "read/write timeout")
 
 	// 域名优先使用的dns服务器
 	priorDomainDns map[string]string
@@ -131,7 +132,9 @@ func init() {
 
 	// 设置域名优先解析的DNS列表
 	priorDomainDns = make(map[string]string)
-	priorDomainDns["itunes.apple.com."] = "202.181.224.2:53:udp"
+	// 将苹果的域名全部使用香港的dns来解析
+	priorDomainDns["apple.com"] = "202.181.224.2:53:udp,202.45.84.58:53:udp"
+	priorDomainDns["google.com"] = "202.181.224.2:53:udp,202.45.84.58:53:udp"
 
 	signal.Notify(saveSig, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
 }
@@ -219,25 +222,36 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			}
 		}
 	}
-	// todo 这里插入优先代码
+	// 优先处理的域名
 	for _, q := range req.Question {
-		// 判断是否有优先级的服务器设置
-		if _, ok := priorDomainDns[q.Name]; ok {
-			// 分割出dns跟proto
-			parts := strings.Split(priorDomainDns[q.Name], ":")
-			proto := parts[2]
-			dns := strings.Join(parts[:2], ":")
-			m, _, err = clientTCP.Exchange(req, dns)
-			if err == nil && len(m.Answer) > 0 {
-				used = dns
-				tried = true
-				log.Printf("优先命中 id: %5d resolve: %v %s %s\n", id, query, dns, proto)
-				break
-			} else {
-				log.Println("优先出错：", err)
+		for pattern, priorDnsString := range priorDomainDns {
+			// 判断是否有优先级的服务器设置
+			if match, _ := regexp.MatchString(pattern, q.Name); match {
+				// 分割出各个dns配置
+				for _, priorDns := range strings.Split(priorDnsString, ",") {
+					// 分割出dns的ip:por跟proto
+					parts := strings.Split(priorDns, ":")
+					proto := parts[2]
+					dns := strings.Join(parts[:2], ":")
+					client := clientUDP
+					if proto == "tcp" {
+						client = clientTCP
+					}
+					m, _, err = client.Exchange(req, dns)
+					if err == nil && len(m.Answer) > 0 {
+						used = dns
+						tried = true
+						log.Printf("优先命中 id: %5d resolve: %v %s %s\n", id, query, dns, proto)
+						// 只要命中就跳出
+						goto priorEnd
+					} else {
+						log.Println("优先出错：", err)
+					}
+				}
 			}
 		}
 	}
+priorEnd:
 	if used == "" {
 		for i, parts := range DNS {
 			dns := parts[0]
